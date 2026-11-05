@@ -692,8 +692,9 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 	burstReplicas := lwsReplicas + int32(maxSurge)
 
 	// wantReplicas calculates the final replicas if needed.
-	wantReplicas := func(unreadyReplicas int32) int32 {
+	wantReplicas := func(unreadyReplicas int32, states []replicaState) int32 {
 		finalReplicas := calculateRollingUpdateReplicas(lwsReplicas, int32(maxSurge), int32(maxUnavailable), unreadyReplicas)
+		finalReplicas = retainAvailableSurge(states, finalReplicas, lwsReplicas-int32(maxUnavailable))
 		if finalReplicas == stsReplicas-1 {
 			r.Record.Eventf(lws, nil, corev1.EventTypeNormal, GroupsProgressing, Delete, fmt.Sprintf("deleting surge replica %s-%d", lws.Name, finalReplicas))
 		} else if finalReplicas < stsReplicas {
@@ -710,7 +711,7 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 		if stsReplicas < lwsReplicas {
 			return partition, lwsReplicas, nil
 		}
-		return partition, wantReplicas(lwsReplicas), nil
+		return partition, wantReplicas(lwsReplicas, nil), nil
 	}
 
 	partition := *sts.Spec.UpdateStrategy.RollingUpdate.Partition
@@ -744,19 +745,24 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 	// Replicas changed during rolling update.
 	if replicasUpdated {
 		partition := min(partition, burstReplicas)
-		return partition, wantReplicas(lwsUnreadyReplicas), nil
+		return partition, wantReplicas(lwsUnreadyReplicas, states), nil
 	}
 
 	// Case 5:
 	// Calculating the Partition during rolling update, no leaderWorkerSet updates happens.
 
+	// Surge replicas reclaimed in this pass are deleted together with the
+	// partition change, so they must not count toward the availability that
+	// lets the partition move.
+	finalReplicas := wantReplicas(lwsUnreadyReplicas, states)
+
 	rollingStep := maxUnavailable
 	// Make sure that we always respect the maxUnavailable, or
 	// we'll violate it when reclaiming bursted replicas.
-	rollingStep += maxSurge - (int(burstReplicas) - int(stsReplicas))
+	rollingStep += maxSurge - (int(burstReplicas) - int(finalReplicas))
 
-	partition = rollingUpdatePartition(states, stsReplicas, int32(rollingStep), partition)
-	return partition, wantReplicas(lwsUnreadyReplicas), nil
+	partition = rollingUpdatePartition(states[:finalReplicas], finalReplicas, int32(rollingStep), partition)
+	return partition, finalReplicas, nil
 }
 
 func (r *LeaderWorkerSetReconciler) SSAWithStatefulset(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, partition, replicas int32, revisionKey string) error {
@@ -1221,6 +1227,30 @@ func calculateRollingUpdateReplicas(lwsReplicas int32, maxSurge int32, maxUnavai
 		return lwsReplicas + requiredSurgeReplicas
 	}
 	return burstReplicas
+}
+
+// retainAvailableSurge raises replicas so that reclaiming surge replicas never
+// deletes the ready groups that keep the LWS within maxUnavailable. Surge
+// replicas are removed from the highest index, and those are often the first
+// updated groups to become ready.
+func retainAvailableSurge(states []replicaState, replicas, minAvailable int32) int32 {
+	var totalReady int32
+	for _, state := range states {
+		if state.ready {
+			totalReady++
+		}
+	}
+	target := min(minAvailable, totalReady)
+	var ready int32
+	for idx := int32(0); idx < int32(len(states)); idx++ {
+		if idx >= replicas && ready >= target {
+			return idx
+		}
+		if states[idx].ready {
+			ready++
+		}
+	}
+	return max(replicas, int32(len(states)))
 }
 
 func calculateContinuousReadyReplicas(states []replicaState) int32 {

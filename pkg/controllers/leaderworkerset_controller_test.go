@@ -1307,6 +1307,107 @@ func TestRollingUpdateParametersTemplateUpdateReclaimsSurgeWhenAllowed(t *testin
 	}
 }
 
+func TestRollingUpdateParametersReclaimSurgeKeepsMaxUnavailable(t *testing.T) {
+	type group struct{ updated, ready bool }
+	oldReady, newReady, newStarting := group{false, true}, group{true, true}, group{true, false}
+	cases := []struct {
+		name                     string
+		replicas, surge, unavail int32
+		partition                int32
+		groups                   []group
+	}{
+		{
+			// Deleting the ready surge groups 5 and 6 must not also let the
+			// partition drop to 0 and recreate the ready old groups 0 and 1.
+			name: "partition ignores surge groups being reclaimed", replicas: 4, surge: 3, unavail: 2, partition: 2,
+			groups: []group{oldReady, oldReady, newStarting, newReady, newStarting, newReady, newReady},
+		},
+		{
+			// Only group 2 and the surge groups 8-10 are ready; reclaiming the
+			// surge groups would leave 1 of 6 groups available.
+			name: "reclaim keeps ready surge groups", replicas: 6, surge: 5, unavail: 4, partition: 0,
+			groups: []group{newStarting, newStarting, newReady, newStarting, newStarting, newStarting,
+				newStarting, newStarting, newReady, newReady, newReady},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+				Replica(int(tc.replicas)).
+				Size(1).
+				RolloutStrategy(leaderworkerset.RolloutStrategy{
+					Type: leaderworkerset.RollingUpdateStrategyType,
+					RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
+						Partition:      ptr.To[int32](0),
+						MaxUnavailable: intstr.FromInt32(tc.unavail),
+						MaxSurge:       intstr.FromInt32(tc.surge),
+					},
+				}).Obj()
+			scheme := runtime.NewScheme()
+			require.NoError(t, appsv1.AddToScheme(scheme))
+			require.NoError(t, corev1.AddToScheme(scheme))
+			var objects []client.Object
+			for i, g := range tc.groups {
+				revision := "rev-old"
+				if g.updated {
+					revision = "rev-new"
+				}
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("%s-%d", lws.Name, i),
+						Namespace: lws.Namespace,
+						Labels: map[string]string{
+							leaderworkerset.SetNameLabelKey:     lws.Name,
+							leaderworkerset.WorkerIndexLabelKey: "0",
+							leaderworkerset.GroupIndexLabelKey:  strconv.Itoa(i),
+							leaderworkerset.RevisionKey:         revision,
+						},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				}
+				if g.ready {
+					pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				}
+				objects = append(objects, pod)
+			}
+			reconciler := &LeaderWorkerSetReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(),
+				Record: fakeEventRecorder{},
+			}
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        lws.Name,
+					Namespace:   lws.Namespace,
+					Annotations: map[string]string{leaderworkerset.ReplicasAnnotationKey: strconv.Itoa(int(tc.replicas))},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: ptr.To(int32(len(tc.groups))),
+					UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+						Type:          appsv1.RollingUpdateStatefulSetStrategyType,
+						RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To(tc.partition)},
+					},
+				},
+			}
+
+			partition, replicas, err := reconciler.rollingUpdateParameters(context.Background(), lws, sts, "rev-new", false)
+			if err != nil {
+				t.Fatalf("rollingUpdateParameters() unexpected error: %v", err)
+			}
+			// A group stays available if the StatefulSet keeps it and does not
+			// recreate it for the new revision.
+			var available int32
+			for i := int32(0); i < replicas; i++ {
+				if g := tc.groups[i]; g.ready && (g.updated || i < partition) {
+					available++
+				}
+			}
+			if minAvailable := tc.replicas - tc.unavail; available < minAvailable {
+				t.Fatalf("partition=%d replicas=%d leaves %d groups available, want at least %d", partition, replicas, available, minAvailable)
+			}
+		})
+	}
+}
+
 func TestDSOrdinalScaleDownDoesNotWaitForStartup(t *testing.T) {
 	for _, size := range []int{1, 2} {
 		for _, tc := range []struct {
